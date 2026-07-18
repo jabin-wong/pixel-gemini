@@ -1,8 +1,11 @@
+from dotenv import load_dotenv; load_dotenv()
 """
 Configuration and constants for the Pixel 10 Pro Google One Gemini Bot.
 """
 
 import os
+
+from dotenv import load_dotenv; load_dotenv()
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
