@@ -25,14 +25,19 @@ from telegram.ext import (
 
 import config
 from device_simulator import create_device_profile
-from google_automation import GoogleAutomationError, check_gemini_offer
+from google_automation import (
+    GoogleAutomationError,
+    check_gemini_offer,
+    initiate_login,
+    complete_login_and_check_offer,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 # ── Conversation states ───────────────────────────────────────────────────────
-AWAIT_EMAIL, AWAIT_PASSWORD = range(2)
+AWAIT_EMAIL, AWAIT_PASSWORD, AWAIT_2FA_CODE = range(3)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -133,9 +138,9 @@ async def login_cancel(update: Update,
 
 # ── /check_offer ──────────────────────────────────────────────────────────────
 
-async def check_offer(update: Update,
-                      context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Run Google One automation and report the result."""
+async def check_offer_start(update: Update,
+                            context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Run Google One automation. Returns next state if 2FA is needed."""
     chat_id = update.effective_chat.id
     session = _get_session(chat_id)
 
@@ -143,7 +148,7 @@ async def check_offer(update: Update,
         await update.message.reply_text(
             "⚠️ No credentials found. Please use /login first."
         )
-        return
+        return ConversationHandler.END
 
     device = session.get("device")
     if not device:
@@ -156,20 +161,45 @@ async def check_offer(update: Update,
     )
 
     try:
-        offer_link = check_gemini_offer(
+        driver, status = initiate_login(
             session["email"],
             session["password"],
             device,
         )
     except GoogleAutomationError as exc:
         await update.message.reply_text(f"❌ *Error:* {exc}", parse_mode="Markdown")
-        return
+        return ConversationHandler.END
     except Exception as exc:
         logger.exception("Unexpected error in check_offer for chat %s", chat_id)
         await update.message.reply_text(
             f"❌ An unexpected error occurred: {exc}"
         )
-        return
+        return ConversationHandler.END
+
+    if status == "2fa":
+        session["pending_driver"] = driver
+        await update.message.reply_text(
+            "🔐 *检测到两步验证*\n\n"
+            "请输入你的 Google 身份验证器中的 6 位验证码：",
+            parse_mode="Markdown",
+        )
+        return AWAIT_2FA_CODE
+
+    if not status:
+        driver.quit()
+        await update.message.reply_text(
+            "❌ *Error:* Login failed – please check your credentials.",
+            parse_mode="Markdown",
+        )
+        return ConversationHandler.END
+
+    # Login succeeded directly – navigate to Google One
+    try:
+        offer_link = complete_login_and_check_offer(driver)
+    except Exception:
+        offer_link = None
+    finally:
+        driver.quit()
 
     if offer_link:
         session["offer_link"] = offer_link
@@ -187,6 +217,113 @@ async def check_offer(update: Update,
             "The offer may not be available for your account region or may "
             "have already been activated. Try again later."
         )
+
+    return ConversationHandler.END
+
+
+async def two_fa_code_input(update: Update,
+                             context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle 2FA verification code input from the user."""
+    chat_id = update.effective_chat.id
+    session = _get_session(chat_id)
+    code = update.message.text.strip()
+
+    # Delete the code message for security
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    # Validate code format
+    if not code.isdigit() or len(code) < 4:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ 验证码格式不正确，请输入 6 位数字验证码：",
+        )
+        return AWAIT_2FA_CODE
+
+    driver = session.pop("pending_driver", None)
+    if not driver:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ 会话已过期，请重新 /check\_offer",
+        )
+        return ConversationHandler.END
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="⏳ 正在验证…",
+    )
+
+    login_ok = True
+    try:
+        offer_link = complete_login_and_check_offer(driver, two_fa_code=code)
+        if offer_link is None:
+            login_ok = _still_logged_in(driver)
+    except Exception as exc:
+        logger.exception("Error during 2FA completion for chat %s", chat_id)
+        offer_link = None
+        login_ok = False
+    finally:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    if offer_link is None and not login_ok:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ 验证码错误或已过期，请重新 /check\_offer",
+        )
+        return ConversationHandler.END
+
+    if offer_link:
+        session["offer_link"] = offer_link
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "🎉 *Gemini Pro Offer Found!*\n\n"
+                "Click the link below to activate your 12-month free Gemini Pro:\n\n"
+                f"🔗 {offer_link}\n\n"
+                "_Use /get\\_link to retrieve this link again._"
+            ),
+            parse_mode="Markdown",
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "✅ 登录成功，但未检测到 Gemini Pro 优惠。\n\n"
+                "该优惠可能不适用于你的账户地区，或已被激活。请稍后再试。"
+            ),
+        )
+
+    return ConversationHandler.END
+
+
+def _still_logged_in(driver) -> bool:
+    """Quick check if the driver is still on a logged-in Google page."""
+    try:
+        current_url = driver.current_url
+        return "myaccount.google.com" in current_url or "/u/" in current_url
+    except Exception:
+        return False
+
+
+async def two_fa_cancel(update: Update,
+                         context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the 2FA flow and clean up the driver."""
+    chat_id = update.effective_chat.id
+    session = _get_session(chat_id)
+    driver = session.pop("pending_driver", None)
+    if driver:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+
+    await update.message.reply_text("❌ 已取消。")
+    return ConversationHandler.END
 
 
 # ── /get_link ─────────────────────────────────────────────────────────────────
@@ -275,7 +412,17 @@ def main() -> None:
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(login_conv)
-    app.add_handler(CommandHandler("check_offer", check_offer))
+    # /check_offer conversation (handles 2FA flow)
+    check_offer_conv = ConversationHandler(
+        entry_points=[CommandHandler("check_offer", check_offer_start)],
+        states={
+            AWAIT_2FA_CODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, two_fa_code_input)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", two_fa_cancel)],
+    )
+    app.add_handler(check_offer_conv)
     app.add_handler(CommandHandler("get_link", get_link))
     app.add_handler(CommandHandler("status", status))
 

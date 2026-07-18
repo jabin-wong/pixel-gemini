@@ -106,6 +106,11 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
         pw_next.click()
         time.sleep(3)
 
+        # ── Check for 2FA challenge ───────────────────────────────────────────
+        if _detect_2fa(driver):
+            logger.info("2FA challenge detected for %s", email)
+            return "2fa"
+
         # ── Verify login ──────────────────────────────────────────────────────
         current_url = driver.current_url
         parsed = urlparse(current_url)
@@ -147,6 +152,133 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
         return False
     except WebDriverException as exc:
         logger.error("WebDriver error during login: %s", exc)
+        return False
+
+
+def _detect_2fa(driver: webdriver.Chrome) -> bool:
+    """Check if the current page is a Google 2-Step Verification challenge."""
+    current_url = driver.current_url
+    if any(kw in current_url.lower() for kw in ("challenge", "verify", "two-step")):
+        return True
+
+    two_fa_selectors = [
+        'input[type="tel"]',
+        "#idvPin",
+        "#idvAnyphoneverify",
+        '[data-challengetype]',
+    ]
+    for selector in two_fa_selectors:
+        try:
+            el = driver.find_element(By.CSS_SELECTOR, selector)
+            if el.is_displayed():
+                return True
+        except NoSuchElementException:
+            continue
+
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+        two_fa_phrases = [
+            "2-step verification",
+            "verify it's you",
+            "verification code",
+            "enter the code",
+            "confirm it's you",
+        ]
+        if any(phrase in body_text for phrase in two_fa_phrases):
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def submit_2fa_code(driver: webdriver.Chrome, code: str) -> bool:
+    """
+    Submit a 2FA verification code on the current Google challenge page.
+    Returns True if login appears successful, False otherwise.
+    """
+    try:
+        input_selectors = [
+            'input[type="tel"]',
+            "#idvPin",
+            'input[aria-label*="code" i]',
+            'input[aria-label*="verification" i]',
+            'input[aria-label*="Enter" i]',
+        ]
+        code_field = None
+        for selector in input_selectors:
+            try:
+                code_field = driver.find_element(By.CSS_SELECTOR, selector)
+                if code_field.is_displayed():
+                    break
+            except NoSuchElementException:
+                continue
+
+        if not code_field:
+            logger.error("Could not find 2FA code input field")
+            return False
+
+        code_field.clear()
+        code_field.send_keys(code)
+        time.sleep(0.5)
+
+        button_selectors = [
+            "#idvPreregisteredPhoneNext",
+            'button[type="submit"]',
+        ]
+        clicked = False
+        for selector in button_selectors:
+            try:
+                btn = driver.find_element(By.CSS_SELECTOR, selector)
+                if btn.is_displayed():
+                    btn.click()
+                    clicked = True
+                    break
+            except NoSuchElementException:
+                continue
+
+        if not clicked:
+            buttons = driver.find_elements(By.TAG_NAME, "button")
+            for btn in buttons:
+                try:
+                    if btn.is_displayed():
+                        btn.click()
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+
+        time.sleep(3)
+
+        current_url = driver.current_url
+        parsed = urlparse(current_url)
+        hostname = parsed.hostname or ""
+        path = parsed.path or ""
+
+        if hostname == "myaccount.google.com" or (
+            hostname.endswith(".google.com") and "/u/" in path
+        ):
+            logger.info("2FA login succeeded")
+            return True
+
+        try:
+            error_el = driver.find_element(
+                By.CSS_SELECTOR, '[jsname="B34EJ"], [aria-live="assertive"]'
+            )
+            if error_el.text:
+                logger.warning("2FA error: %s", error_el.text)
+                return False
+        except NoSuchElementException:
+            pass
+
+        if "challenge" not in current_url.lower():
+            logger.info("2FA login appeared successful (URL: %s)", current_url)
+            return True
+
+        return False
+
+    except Exception as exc:
+        logger.error("Error submitting 2FA code: %s", exc)
         return False
 
 
@@ -255,6 +387,44 @@ class GoogleAutomationError(Exception):
     """Raised when automation encounters an unrecoverable error."""
 
 
+def initiate_login(email: str, password: str,
+                   device: DeviceProfile) -> tuple:
+    """
+    Start the Google login process and return (driver, status).
+
+    Status values:
+      - True: login succeeded, driver is on the account page
+      - False: login failed, driver should be quit
+      - "2fa": 2FA challenge detected, driver is kept alive for code submission
+
+    The caller is responsible for calling driver.quit() when done.
+    """
+    driver = _build_driver(device)
+    try:
+        result = _gmail_login(driver, email, password)
+        return driver, result
+    except Exception:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        raise
+
+
+def complete_login_and_check_offer(driver: webdriver.Chrome,
+                                   two_fa_code: str = None) -> Optional[str]:
+    """
+    Complete the login and navigate to Google One to find the Gemini Pro offer.
+
+    If *two_fa_code* is provided, submit 2FA verification first.
+    Returns the offer link (str) or None.
+    """
+    if two_fa_code is not None:
+        if not submit_2fa_code(driver, two_fa_code):
+            return None
+    return _navigate_google_one(driver)
+
+
 def check_gemini_offer(email: str, password: str,
                        device: DeviceProfile) -> Optional[str]:
     """
@@ -272,6 +442,11 @@ def check_gemini_offer(email: str, password: str,
         driver = _build_driver(device)
 
         logged_in = _gmail_login(driver, email, password)
+        if logged_in == "2fa":
+            raise GoogleAutomationError(
+                "Two-step verification required. "
+                "This account has 2FA enabled – use the interactive flow."
+            )
         if not logged_in:
             raise GoogleAutomationError(
                 "Login failed – please check your credentials."
