@@ -189,7 +189,7 @@ async def check_offer_start(update: Update,
         return AWAIT_2FA_CODE
 
     if not status:
-        browser.close()
+        await asyncio.to_thread(browser.close)
         await update.message.reply_text(
             "❌ *Error:* Login failed – please check your credentials.",
             parse_mode="Markdown",
@@ -204,7 +204,7 @@ async def check_offer_start(update: Update,
     except Exception:
         offer_link = None
     finally:
-        browser.close()
+        await asyncio.to_thread(browser.close)
 
     if offer_link:
         session["offer_link"] = offer_link
@@ -275,7 +275,7 @@ async def two_fa_code_input(update: Update,
         login_ok = False
     finally:
         try:
-            browser.close()
+            await asyncio.to_thread(browser.close)
         except Exception:
             pass
 
@@ -328,7 +328,7 @@ async def two_fa_cancel(update: Update,
     session.pop("pending_page", None)
     if browser:
         try:
-            browser.close()
+            await asyncio.to_thread(browser.close)
         except Exception:
             pass
 
