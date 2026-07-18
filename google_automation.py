@@ -84,19 +84,43 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
     Returns True on apparent success, False on detectable failure.
     """
     try:
+        logger.info("Starting login for %s", email)
         driver.get(config.GMAIL_LOGIN_URL)
+        logger.info("Loaded login page: %s", driver.current_url)
         time.sleep(2)
 
         # ── Email step ────────────────────────────────────────────────────────
-        email_field = _wait_for(driver, By.CSS_SELECTOR,
-                                'input[type="email"]')
+        logger.info("Waiting for email field...")
+        # Google may use different input types; try multiple selectors
+        email_selectors = [
+            (By.CSS_SELECTOR, 'input[type="email"]'),
+            (By.ID, "identifierId"),
+            (By.CSS_SELECTOR, 'input[name="identifier"]'),
+            (By.CSS_SELECTOR, 'input[aria-label*="email" i]'),
+            (By.CSS_SELECTOR, 'input[aria-label*="phone" i]'),
+        ]
+        email_field = None
+        for by, sel in email_selectors:
+            try:
+                email_field = _wait_for(driver, by, sel, timeout=5)
+                if email_field.is_displayed():
+                    logger.info("Email field found via: %s", sel)
+                    break
+            except TimeoutException:
+                continue
+        if not email_field:
+            logger.error("Could not find email input field")
+            return False
+        logger.info("Email field found, entering email")
         email_field.clear()
         email_field.send_keys(email)
         time.sleep(0.5)
 
         # Press Enter to submit (more natural, avoids click detection)
+        logger.info("Pressing RETURN to submit email")
         email_field.send_keys(Keys.RETURN)
         time.sleep(3)
+        logger.info("After RETURN, current URL: %s", driver.current_url)
 
         # If still on identifier page, fall back to clicking Next button
         if "signin/identifier" in driver.current_url:
@@ -111,6 +135,7 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
                         break
                 except Exception:
                     continue
+            logger.info("After button click, current URL: %s", driver.current_url)
 
         # ── Check for 2FA / challenge after email ────────────────────────────
         if _detect_2fa(driver):
@@ -118,8 +143,23 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
             return "2fa"
 
         # ── Password step ─────────────────────────────────────────────────────
-        password_field = _wait_for(driver, By.CSS_SELECTOR,
-                                   'input[type="password"]')
+        password_selectors = [
+            (By.CSS_SELECTOR, 'input[type="password"]'),
+            (By.CSS_SELECTOR, 'input[name="Passwd"]'),
+            (By.CSS_SELECTOR, 'input[aria-label*="password" i]'),
+        ]
+        password_field = None
+        for by, sel in password_selectors:
+            try:
+                password_field = _wait_for(driver, by, sel, timeout=5)
+                if password_field.is_displayed():
+                    logger.info("Password field found via: %s", sel)
+                    break
+            except TimeoutException:
+                continue
+        if not password_field:
+            logger.error("Could not find password field. URL: %s", driver.current_url)
+            return False
         password_field.clear()
         password_field.send_keys(password)
 
