@@ -90,17 +90,40 @@ def _gmail_login(page: Page, email: str, password: str) -> bool:
         # Handle rejection
         if "signin/rejected" in page.url:
             logger.info("Google rejected sign-in, trying recovery")
-            # Try clicking "Try again" or "Next"
-            for text in ["Try again", "Next", "Verify"]:
+            # Dump page for debugging
+            try:
+                with open("/tmp/google_rejected_pw.html", "w", encoding="utf-8") as f:
+                    f.write(page.content())
+                logger.info("Saved rejected page HTML")
+            except Exception:
+                pass
+            # Try multiple approaches to find clickable elements
+            clicked_something = False
+            for sel in [
+                "button",
+                "a[href]",
+                "[role='button']",
+            ]:
                 try:
-                    btn = page.get_by_role("button", name=text)
-                    if btn.is_visible():
-                        btn.click()
-                        page.wait_for_timeout(3000)
-                        logger.info("Clicked '%s', URL: %s", text, page.url)
+                    elements = page.locator(sel)
+                    count = elements.count()
+                    for i in range(min(count, 20)):
+                        el = elements.nth(i)
+                        text = (el.text_content() or "").strip().lower()
+                        if text and any(kw in text for kw in ["next", "try again", "verify", "continue", "sign in"]):
+                            logger.info("Clicking '%s' (%s)", text[:50], sel)
+                            el.click()
+                            page.wait_for_timeout(3000)
+                            logger.info("After click, URL: %s", page.url)
+                            clicked_something = True
+                            break
+                    if clicked_something:
                         break
-                except Exception:
-                    continue
+                except Exception as e:
+                    logger.debug("Selector %s failed: %s", sel, e)
+
+            if not clicked_something:
+                logger.warning("No recovery elements found on rejected page")
 
             if "signin/rejected" in page.url:
                 logger.warning("Still rejected after recovery attempts")
@@ -341,6 +364,64 @@ def _navigate_google_one(page: Page) -> Optional[str]:
 
 class GoogleAutomationError(Exception):
     """Raised when automation encounters an unrecoverable error."""
+
+
+import json
+
+
+def load_cookies_and_check_offer(device: DeviceProfile,
+                                 cookies_json: str) -> Optional[str]:
+    """
+    Load cookies from JSON, navigate to Google One, and find the Gemini offer.
+
+    The cookies should be a JSON array of cookie objects with at least
+    'name', 'value', and 'domain' fields (EditThisCookie format).
+    Returns the offer link or None.
+    """
+    browser = None
+    try:
+        cookies = json.loads(cookies_json)
+        if not isinstance(cookies, list):
+            raise GoogleAutomationError("Cookies must be a JSON array")
+
+        logger.info("Loading %d cookies and checking Google One", len(cookies))
+        browser, context, page = _build_browser(device)
+
+        # First navigate to Google to set the domain context
+        page.goto("https://accounts.google.com", wait_until="domcontentloaded")
+        page.wait_for_timeout(1000)
+
+        # Add cookies
+        for cookie in cookies:
+            try:
+                c = {
+                    "name": cookie["name"],
+                    "value": cookie["value"],
+                    "domain": cookie.get("domain", ".google.com"),
+                    "path": cookie.get("path", "/"),
+                }
+                if "expirationDate" in cookie:
+                    c["expires"] = cookie["expirationDate"]
+                if "httpOnly" in cookie:
+                    c["httpOnly"] = cookie["httpOnly"]
+                if "secure" in cookie:
+                    c["secure"] = cookie["secure"]
+                page.context.add_cookies([c])
+            except Exception as e:
+                logger.warning("Skipping cookie %s: %s", cookie.get("name", "?"), e)
+
+        logger.info("Cookies loaded, navigating to Google One")
+        offer_link = _navigate_google_one(page)
+        return offer_link
+
+    except json.JSONDecodeError as e:
+        raise GoogleAutomationError(f"Invalid JSON: {e}")
+    finally:
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
 
 
 def initiate_login(email: str, password: str,

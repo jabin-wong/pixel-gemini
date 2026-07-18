@@ -31,6 +31,7 @@ from google_automation import (
     check_gemini_offer,
     initiate_login,
     complete_login_and_check_offer,
+    load_cookies_and_check_offer,
 )
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -38,7 +39,7 @@ logging.basicConfig(level=config.LOG_LEVEL, format=config.LOG_FORMAT)
 logger = logging.getLogger(__name__)
 
 # ── Conversation states ───────────────────────────────────────────────────────
-AWAIT_EMAIL, AWAIT_PASSWORD, AWAIT_2FA_CODE = range(3)
+AWAIT_EMAIL, AWAIT_PASSWORD, AWAIT_2FA_CODE, AWAIT_COOKIES = range(4)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -62,6 +63,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📋 *Available Commands:*\n"
         "• /login – Enter your Gmail credentials\n"
         "• /check\\_offer – Detect the Gemini Pro offer\n"
+        "• /import\\_cookies – Import Google cookies to skip login\n"
         "• /get\\_link – Show the last captured offer link\n"
         "• /status – View current session & device info\n\n"
         "⚠️ *Privacy Note:* Credentials are held in memory only for the "
@@ -336,6 +338,84 @@ async def two_fa_cancel(update: Update,
     return ConversationHandler.END
 
 
+# ── /import_cookies ──────────────────────────────────────────────────────────
+
+async def import_cookies_start(update: Update,
+                                context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ask user to paste cookies JSON."""
+    await update.message.reply_text(
+        "🍪 *导入 Cookies*\n\n"
+        "请从 Chrome 导出 Google cookies 并粘贴 JSON 内容：\n\n"
+        "1. 安装 Chrome 扩展 *EditThisCookie*\n"
+        "2. 打开 https://accounts.google.com 并确保已登录\n"
+        "3. 点击扩展图标 → Export → 复制全部 JSON\n"
+        "4. 粘贴到这里",
+        parse_mode="Markdown",
+    )
+    return AWAIT_COOKIES
+
+
+async def import_cookies_receive(update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Receive cookies JSON, load them, and check for Gemini offer."""
+    chat_id = update.effective_chat.id
+    session = _get_session(chat_id)
+    cookies_text = update.message.text.strip()
+
+    # Delete the message for security
+    try:
+        await update.message.delete()
+    except Exception:
+        pass
+
+    device = session.get("device")
+    if not device:
+        device = create_device_profile()
+        session["device"] = device
+
+    await update.message.reply_text(
+        "⏳ Loading cookies and checking Google One…"
+    )
+
+    try:
+        offer_link = await asyncio.to_thread(
+            load_cookies_and_check_offer, device, cookies_text
+        )
+    except GoogleAutomationError as exc:
+        await update.message.reply_text(f"❌ *Error:* {exc}", parse_mode="Markdown")
+        return ConversationHandler.END
+    except Exception as exc:
+        logger.exception("Error in import_cookies for chat %s", chat_id)
+        await update.message.reply_text(f"❌ Error: {exc}")
+        return ConversationHandler.END
+
+    if offer_link:
+        session["offer_link"] = offer_link
+        await update.message.reply_text(
+            "🎉 *Gemini Pro Offer Found!*\n\n"
+            f"🔗 {offer_link}\n\n"
+            "_Use /get\\_link to retrieve this link again._",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(
+            "😔 No Gemini Pro offer detected.\n\n"
+            "可能原因：\n"
+            "• Cookies 已过期（重新导出）\n"
+            "• 账户地区不支持该优惠\n"
+            "• 优惠已被激活"
+        )
+
+    return ConversationHandler.END
+
+
+async def import_cookies_cancel(update: Update,
+                                 context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the cookies import."""
+    await update.message.reply_text("❌ 已取消。")
+    return ConversationHandler.END
+
+
 # ── /get_link ─────────────────────────────────────────────────────────────────
 
 async def get_link(update: Update,
@@ -433,6 +513,17 @@ def main() -> None:
         fallbacks=[CommandHandler("cancel", two_fa_cancel)],
     )
     app.add_handler(check_offer_conv)
+    # /import_cookies conversation
+    cookies_conv = ConversationHandler(
+        entry_points=[CommandHandler("import_cookies", import_cookies_start)],
+        states={
+            AWAIT_COOKIES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, import_cookies_receive)
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", import_cookies_cancel)],
+    )
+    app.add_handler(cookies_conv)
     app.add_handler(CommandHandler("get_link", get_link))
     app.add_handler(CommandHandler("status", status))
 
