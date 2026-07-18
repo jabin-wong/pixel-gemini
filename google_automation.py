@@ -20,6 +20,7 @@ from selenium.common.exceptions import (
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
@@ -91,10 +92,25 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
                                 'input[type="email"]')
         email_field.clear()
         email_field.send_keys(email)
+        time.sleep(0.5)
 
-        next_btn = _wait_for(driver, By.ID, "identifierNext")
-        next_btn.click()
+        # Press Enter to submit (more natural, avoids click detection)
+        email_field.send_keys(Keys.RETURN)
         time.sleep(3)
+
+        # If still on identifier page, fall back to clicking Next button
+        if "signin/identifier" in driver.current_url:
+            logger.info("RETURN did not advance, trying button click")
+            for sel_id in ["identifierNext", "LgbsSe"]:
+                try:
+                    btn = driver.find_element(By.ID, sel_id)
+                    if btn.is_displayed():
+                        btn.click()
+                        logger.info("Clicked Next via ID: %s", sel_id)
+                        time.sleep(3)
+                        break
+                except Exception:
+                    continue
 
         # ── Check for 2FA / challenge after email ────────────────────────────
         if _detect_2fa(driver):
