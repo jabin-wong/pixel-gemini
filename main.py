@@ -9,6 +9,7 @@ Commands:
   /status       – Show current session status and device profile
 """
 
+import asyncio
 import logging
 import os
 import sys
@@ -161,7 +162,8 @@ async def check_offer_start(update: Update,
     )
 
     try:
-        browser, context, page, status = initiate_login(
+        browser, context, page, status = await asyncio.to_thread(
+            initiate_login,
             session["email"],
             session["password"],
             device,
@@ -196,7 +198,9 @@ async def check_offer_start(update: Update,
 
     # Login succeeded directly – navigate to Google One
     try:
-        offer_link = complete_login_and_check_offer(page)
+        offer_link = await asyncio.to_thread(
+            complete_login_and_check_offer, page
+        )
     except Exception:
         offer_link = None
     finally:
@@ -260,7 +264,9 @@ async def two_fa_code_input(update: Update,
 
     login_ok = True
     try:
-        offer_link = complete_login_and_check_offer(page, two_fa_code=code)
+        offer_link = await asyncio.to_thread(
+            complete_login_and_check_offer, page, code
+        )
         if offer_link is None:
             login_ok = _still_logged_in(page)
     except Exception as exc:
