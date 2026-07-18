@@ -29,8 +29,9 @@ pixel-gemini/
 | 📱 Device simulation | Pixel 10 Pro (Android 16) with unique IMEI, Android ID, and user-agent per session |
 | 🤖 Telegram bot | `/start`, `/login`, `/check_offer`, `/get_link`, `/status` commands |
 | 🔐 Gmail login | Selenium-based Google account authentication |
+| 🔑 2FA support | Detects two-step verification and prompts user for authenticator code via Telegram |
 | 💳 Offer detection | Scans Google One for the 12-month Gemini Pro offer and extracts the activation link |
-| 🔄 Session management | In-memory per-user sessions; passwords deleted from chat on capture |
+| 🔄 Session management | In-memory per-user sessions; passwords and 2FA codes deleted from chat on capture |
 
 ---
 
@@ -81,11 +82,11 @@ The bot will start polling for Telegram updates.
 |---|---|
 | `/start` | Show welcome message and command list |
 | `/login` | Enter Gmail email and password (two-step conversation) |
-| `/check_offer` | Simulate device, log in, and search for the Gemini Pro offer |
+| `/check_offer` | Simulate device, log in, and search for the Gemini Pro offer. If 2FA is enabled, bot will prompt for verification code. |
 | `/get_link` | Retrieve the last captured offer link |
 | `/status` | View current session info and device profile |
 
-### Typical flow
+### Typical flow (without 2FA)
 
 ```
 You: /start
@@ -105,6 +106,19 @@ Bot: ⏳ Launching device simulator…
 Bot: 🎉 Gemini Pro Offer Found! 🔗 https://one.google.com/…
 ```
 
+### Typical flow (with 2FA)
+
+```
+You: /check_offer
+Bot: ⏳ Launching device simulator and logging in…
+Bot: 🔐 检测到两步验证
+     请输入你的 Google 身份验证器中的 6 位验证码：
+
+You: 123456
+Bot: ⏳ 正在验证…
+Bot: 🎉 Gemini Pro Offer Found! 🔗 https://one.google.com/…
+```
+
 ---
 
 ## Technical Notes
@@ -117,7 +131,11 @@ Bot: 🎉 Gemini Pro Offer Found! 🔗 https://one.google.com/…
   the Chrome patch version and Android ID to reduce fingerprinting.
 - Credentials are stored **in memory only** and never written to disk.
   The Telegram message containing the password is deleted immediately after
-  being read.
+  being read. 2FA verification codes are also deleted from chat after capture.
+- **Two-step verification (2FA)** is supported via an interactive flow.
+  When the bot detects a Google 2FA challenge page (by URL, CSS selectors,
+  and page text), it prompts the user in Telegram for the authenticator code,
+  submits it, and continues to Google One.
 
 ---
 
