@@ -133,6 +133,37 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
         time.sleep(3)
         logger.info("After RETURN, current URL: %s", driver.current_url)
 
+        # Handle Google rejection page (suspicious sign-in blocked)
+        if "signin/rejected" in driver.current_url:
+            logger.info("Google rejected sign-in, looking for recovery options")
+            # Try clicking "Try again" or verification link
+            recovery_selectors = [
+                'a[href*="recovery"]',
+                'a[href*="challenge"]',
+                'a[jsname="JFyozc"]',
+                'a:has-text("Try again")',
+                'button:has-text("Try again")',
+                'a:has-text("Verify")',
+            ]
+            for sel in recovery_selectors:
+                try:
+                    el = driver.find_element(By.CSS_SELECTOR, sel)
+                    if el.is_displayed():
+                        logger.info("Clicking recovery element: %s", sel)
+                        el.click()
+                        time.sleep(3)
+                        logger.info("After recovery click, URL: %s", driver.current_url)
+                        break
+                except Exception:
+                    continue
+
+            # If still rejected, try going back to login with a fresh approach
+            if "signin/rejected" in driver.current_url:
+                logger.info("Still rejected, retrying with direct navigation")
+                driver.get("https://accounts.google.com/signin/v2/challenge/password?flowName=GlifWebSignIn&flowEntry=ServiceLogin")
+                time.sleep(3)
+                logger.info("After retry nav, URL: %s", driver.current_url)
+
         # If still on identifier page, fall back to clicking Next button
         if "signin/identifier" in driver.current_url:
             logger.info("RETURN did not advance, trying button click")
@@ -242,7 +273,7 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
 def _detect_2fa(driver: webdriver.Chrome) -> bool:
     """Check if the current page is a Google 2-Step Verification challenge."""
     current_url = driver.current_url
-    if any(kw in current_url.lower() for kw in ("challenge", "verify", "two-step")):
+    if any(kw in current_url.lower() for kw in ("challenge", "verify", "two-step", "rejected")):
         return True
 
     two_fa_selectors = [
