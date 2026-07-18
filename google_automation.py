@@ -136,6 +136,13 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
         # Handle Google rejection page (suspicious sign-in blocked)
         if "signin/rejected" in driver.current_url:
             logger.info("Google rejected sign-in, looking for recovery options")
+            # Dump page source for debugging
+            try:
+                with open("/tmp/google_rejected.html", "w", encoding="utf-8") as f:
+                    f.write(driver.page_source)
+                logger.info("Saved rejected page HTML to /tmp/google_rejected.html")
+            except Exception as e:
+                logger.warning("Could not save page source: %s", e)
             # Try clicking "Try again" or verification link
             recovery_selectors = [
                 'a[href*="recovery"]',
