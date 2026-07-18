@@ -59,9 +59,24 @@ def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
     options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-features=IsolateOrigins,site-per-process")
 
     service = Service()  # relies on chromedriver being on PATH (Replit provides it)
     driver = webdriver.Chrome(service=service, options=options)
+
+    # ── Anti-detection: hide webdriver via CDP ───────────────────────────────
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                window.chrome = {runtime: {}};
+            """
+        },
+    )
+
     driver.implicitly_wait(config.IMPLICIT_WAIT)
     driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)
     return driver
@@ -136,6 +151,18 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
                 except Exception:
                     continue
             logger.info("After button click, current URL: %s", driver.current_url)
+
+        # If STILL on identifier page, use JavaScript to submit the form
+        if "signin/identifier" in driver.current_url:
+            logger.info("Button click also failed, trying JS form submit")
+            try:
+                driver.execute_script(
+                    "document.querySelector('form').submit();"
+                )
+                time.sleep(3)
+                logger.info("After JS submit, current URL: %s", driver.current_url)
+            except Exception as e:
+                logger.warning("JS submit failed: %s", e)
 
         # ── Check for 2FA / challenge after email ────────────────────────────
         if _detect_2fa(driver):
