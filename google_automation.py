@@ -94,7 +94,12 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
 
         next_btn = _wait_for(driver, By.ID, "identifierNext")
         next_btn.click()
-        time.sleep(2)
+        time.sleep(3)
+
+        # ── Check for 2FA / challenge after email ────────────────────────────
+        if _detect_2fa(driver):
+            logger.info("2FA challenge detected after email for %s", email)
+            return "2fa"
 
         # ── Password step ─────────────────────────────────────────────────────
         password_field = _wait_for(driver, By.CSS_SELECTOR,
@@ -148,7 +153,7 @@ def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
         return False
 
     except TimeoutException as exc:
-        logger.error("Timeout during login: %s", exc)
+        logger.error("Timeout during login (URL: %s): %s", driver.current_url, exc)
         return False
     except WebDriverException as exc:
         logger.error("WebDriver error during login: %s", exc)
