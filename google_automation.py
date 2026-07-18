@@ -1,5 +1,5 @@
 """
-Google One automation using Selenium.
+Google One automation using Playwright.
 
 Logs into a Gmail account, navigates to Google One, detects the
 12-month free Gemini Pro offer, and returns the activation / payment link.
@@ -11,20 +11,7 @@ import re
 from urllib.parse import urlparse
 from typing import Optional
 
-from selenium import webdriver
-from selenium.common.exceptions import (
-    NoSuchElementException,
-    TimeoutException,
-    WebDriverException,
-)
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-
-from selenium_stealth import stealth
+from playwright.sync_api import sync_playwright, Page, Browser, BrowserContext, TimeoutError as PwTimeout
 
 import config
 from device_simulator import DeviceProfile
@@ -32,254 +19,185 @@ from device_simulator import DeviceProfile
 logger = logging.getLogger(__name__)
 
 
-# ── Driver factory ────────────────────────────────────────────────────────────
+# ── Browser factory ──────────────────────────────────────────────────────────
 
-def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
-    """Return a stealth Chrome WebDriver configured for the device profile."""
-    options = Options()
+_playwright_instance = None
 
-    if config.HEADLESS:
-        options.add_argument("--headless=new")
 
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--window-size=390,844")
-    options.add_argument(f"--user-agent={profile.user_agent}")
+def _get_playwright():
+    global _playwright_instance
+    if _playwright_instance is None:
+        _playwright_instance = sync_playwright().start()
+    return _playwright_instance
 
-    # Mobile emulation
-    mobile_emulation = {
-        "deviceMetrics": {"width": 390, "height": 844, "pixelRatio": 3.0},
-        "userAgent": profile.user_agent,
-    }
-    options.add_experimental_option("mobileEmulation", mobile_emulation)
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
 
-    service = Service()
-    driver = webdriver.Chrome(service=service, options=options)
+def _build_browser(profile: DeviceProfile) -> tuple:
+    """Return (browser, context, page) configured for the device profile."""
+    pw = _get_playwright()
 
-    # Apply stealth patches to evade bot detection
-    stealth(
-        driver,
-        languages=["en-US", "en"],
-        vendor="Google Inc.",
-        platform="Linux armv8l",
-        webgl_vendor="Qualcomm",
-        renderer="Adreno (TM) 750",
-        fix_hairline=True,
+    browser = pw.chromium.launch(
+        headless=config.HEADLESS,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+        ],
     )
 
-    driver.implicitly_wait(config.IMPLICIT_WAIT)
-    driver.set_page_load_timeout(config.PAGE_LOAD_TIMEOUT)
-    return driver
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        device_scale_factor=3.0,
+        user_agent=profile.user_agent,
+        locale="en-US",
+        timezone_id="America/New_York",
+        permissions=["geolocation"],
+        geolocation={"latitude": 40.7128, "longitude": -74.0060},
+    )
+
+    page = context.new_page()
+    return browser, context, page
 
 
 # ── Login helper ──────────────────────────────────────────────────────────────
 
-def _wait_for(driver: webdriver.Chrome, by: str, value: str,
-               timeout: int = config.WEBDRIVER_TIMEOUT) -> object:
-    """Return element after waiting for it to be clickable."""
-    return WebDriverWait(driver, timeout).until(
-        EC.element_to_be_clickable((by, value))
-    )
-
-
-def _gmail_login(driver: webdriver.Chrome, email: str, password: str) -> bool:
+def _gmail_login(page: Page, email: str, password: str) -> bool:
     """
-    Perform Gmail / Google account login.
+    Perform Gmail / Google account login via Playwright.
 
-    Returns True on apparent success, False on detectable failure.
+    Returns True on success, False on failure, "2fa" if 2FA detected.
     """
     try:
         logger.info("Starting login for %s", email)
-        driver.get(config.GMAIL_LOGIN_URL)
-        logger.info("Loaded login page: %s", driver.current_url)
-        time.sleep(2)
+        page.goto(config.GMAIL_LOGIN_URL, wait_until="domcontentloaded")
+        logger.info("Loaded login page: %s", page.url)
+        page.wait_for_timeout(2000)
 
         # ── Email step ────────────────────────────────────────────────────────
         logger.info("Waiting for email field...")
-        # Google may use different input types; try multiple selectors
-        email_selectors = [
-            (By.CSS_SELECTOR, 'input[type="email"]'),
-            (By.ID, "identifierId"),
-            (By.CSS_SELECTOR, 'input[name="identifier"]'),
-            (By.CSS_SELECTOR, 'input[aria-label*="email" i]'),
-            (By.CSS_SELECTOR, 'input[aria-label*="phone" i]'),
-        ]
-        email_field = None
-        for by, sel in email_selectors:
-            try:
-                email_field = _wait_for(driver, by, sel, timeout=5)
-                if email_field.is_displayed():
-                    logger.info("Email field found via: %s", sel)
-                    break
-            except TimeoutException:
-                continue
-        if not email_field:
-            logger.error("Could not find email input field")
-            return False
+        email_sel = 'input[type="email"], #identifierId, input[name="identifier"]'
+        page.wait_for_selector(email_sel, timeout=config.WEBDRIVER_TIMEOUT * 1000)
         logger.info("Email field found, entering email")
-        email_field.clear()
-        email_field.send_keys(email)
-        time.sleep(0.5)
+        page.fill(email_sel, email)
+        page.wait_for_timeout(500)
 
-        # Press Enter to submit (more natural, avoids click detection)
-        logger.info("Pressing RETURN to submit email")
-        email_field.send_keys(Keys.RETURN)
-        time.sleep(3)
-        logger.info("After RETURN, current URL: %s", driver.current_url)
+        # Press Enter to submit
+        logger.info("Pressing Enter to submit email")
+        page.press(email_sel, "Enter")
+        page.wait_for_timeout(3000)
+        logger.info("After Enter, current URL: %s", page.url)
 
-        # Handle Google rejection page (suspicious sign-in blocked)
-        if "signin/rejected" in driver.current_url:
-            logger.info("Google rejected sign-in, looking for recovery options")
-            # Dump page source for debugging
-            try:
-                with open("/tmp/google_rejected.html", "w", encoding="utf-8") as f:
-                    f.write(driver.page_source)
-                logger.info("Saved rejected page HTML to /tmp/google_rejected.html")
-            except Exception as e:
-                logger.warning("Could not save page source: %s", e)
-            # Try clicking "Try again" or verification link
-            recovery_selectors = [
-                'a[href*="recovery"]',
-                'a[href*="challenge"]',
-                'a[jsname="JFyozc"]',
-                'a:has-text("Try again")',
-                'button:has-text("Try again")',
-                'a:has-text("Verify")',
-            ]
-            for sel in recovery_selectors:
+        # Handle rejection
+        if "signin/rejected" in page.url:
+            logger.info("Google rejected sign-in, trying recovery")
+            # Try clicking "Try again" or "Next"
+            for text in ["Try again", "Next", "Verify"]:
                 try:
-                    el = driver.find_element(By.CSS_SELECTOR, sel)
-                    if el.is_displayed():
-                        logger.info("Clicking recovery element: %s", sel)
-                        el.click()
-                        time.sleep(3)
-                        logger.info("After recovery click, URL: %s", driver.current_url)
-                        break
-                except Exception:
-                    continue
-
-            # If still rejected, try going back to login with a fresh approach
-            if "signin/rejected" in driver.current_url:
-                logger.info("Still rejected, retrying with direct navigation")
-                driver.get("https://accounts.google.com/signin/v2/challenge/password?flowName=GlifWebSignIn&flowEntry=ServiceLogin")
-                time.sleep(3)
-                logger.info("After retry nav, URL: %s", driver.current_url)
-
-        # If still on identifier page, fall back to clicking Next button
-        if "signin/identifier" in driver.current_url:
-            logger.info("RETURN did not advance, trying button click")
-            for sel_id in ["identifierNext", "LgbsSe"]:
-                try:
-                    btn = driver.find_element(By.ID, sel_id)
-                    if btn.is_displayed():
+                    btn = page.get_by_role("button", name=text)
+                    if btn.is_visible():
                         btn.click()
-                        logger.info("Clicked Next via ID: %s", sel_id)
-                        time.sleep(3)
+                        page.wait_for_timeout(3000)
+                        logger.info("Clicked '%s', URL: %s", text, page.url)
                         break
                 except Exception:
                     continue
-            logger.info("After button click, current URL: %s", driver.current_url)
 
-        # If STILL on identifier page, use JavaScript to submit the form
-        if "signin/identifier" in driver.current_url:
-            logger.info("Button click also failed, trying JS form submit")
-            try:
-                driver.execute_script(
-                    "document.querySelector('form').submit();"
-                )
-                time.sleep(3)
-                logger.info("After JS submit, current URL: %s", driver.current_url)
-            except Exception as e:
-                logger.warning("JS submit failed: %s", e)
+            if "signin/rejected" in page.url:
+                logger.warning("Still rejected after recovery attempts")
+                return False
+
+        # If still on identifier, try clicking Next button
+        if "signin/identifier" in page.url:
+            logger.info("Enter did not advance, trying button click")
+            for btn_id in ["identifierNext", "LgbsSe"]:
+                try:
+                    btn = page.locator(f"#{btn_id}")
+                    if btn.is_visible():
+                        btn.click()
+                        page.wait_for_timeout(3000)
+                        logger.info("Clicked %s, URL: %s", btn_id, page.url)
+                        break
+                except Exception:
+                    continue
 
         # ── Check for 2FA / challenge after email ────────────────────────────
-        if _detect_2fa(driver):
+        if _detect_2fa(page):
             logger.info("2FA challenge detected after email for %s", email)
             return "2fa"
 
         # ── Password step ─────────────────────────────────────────────────────
-        password_selectors = [
-            (By.CSS_SELECTOR, 'input[type="password"]'),
-            (By.CSS_SELECTOR, 'input[name="Passwd"]'),
-            (By.CSS_SELECTOR, 'input[aria-label*="password" i]'),
-        ]
-        password_field = None
-        for by, sel in password_selectors:
-            try:
-                password_field = _wait_for(driver, by, sel, timeout=5)
-                if password_field.is_displayed():
-                    logger.info("Password field found via: %s", sel)
-                    break
-            except TimeoutException:
-                continue
-        if not password_field:
-            logger.error("Could not find password field. URL: %s", driver.current_url)
+        pw_sel = 'input[type="password"], input[name="Passwd"]'
+        try:
+            page.wait_for_selector(pw_sel, timeout=config.WEBDRIVER_TIMEOUT * 1000)
+        except PwTimeout:
+            logger.error("Password field not found. URL: %s", page.url)
             return False
-        password_field.clear()
-        password_field.send_keys(password)
 
-        pw_next = _wait_for(driver, By.ID, "passwordNext")
-        pw_next.click()
-        time.sleep(3)
+        logger.info("Password field found, entering password")
+        page.fill(pw_sel, password)
+        page.wait_for_timeout(500)
 
-        # ── Check for 2FA challenge ───────────────────────────────────────────
-        if _detect_2fa(driver):
-            logger.info("2FA challenge detected for %s", email)
+        # Submit password
+        page.press(pw_sel, "Enter")
+        page.wait_for_timeout(3000)
+
+        # Also try clicking passwordNext if Enter didn't work
+        if "signin" in page.url and "challenge" not in page.url:
+            try:
+                btn = page.locator("#passwordNext")
+                if btn.is_visible():
+                    btn.click()
+                    page.wait_for_timeout(3000)
+            except Exception:
+                pass
+
+        # ── Check for 2FA after password ─────────────────────────────────────
+        if _detect_2fa(page):
+            logger.info("2FA challenge detected after password for %s", email)
             return "2fa"
 
         # ── Verify login ──────────────────────────────────────────────────────
-        current_url = driver.current_url
+        current_url = page.url
         parsed = urlparse(current_url)
         hostname = parsed.hostname or ""
         path = parsed.path or ""
-        if (
-            hostname == "myaccount.google.com"
-            or hostname.endswith(".google.com")
-            and "/u/" in path
+
+        if hostname == "myaccount.google.com" or (
+            hostname.endswith(".google.com") and "/u/" in path
         ):
             logger.info("Login succeeded for %s", email)
             return True
 
         # Check for error messages
         try:
-            error_el = driver.find_element(
-                By.CSS_SELECTOR, '[jsname="B34EJ"], [aria-live="assertive"]'
-            )
-            if error_el.text:
-                logger.warning("Login error detected: %s", error_el.text)
-                return False
-        except NoSuchElementException:
+            error_el = page.locator('[jsname="B34EJ"], [aria-live="assertive"]')
+            if error_el.is_visible():
+                err_text = error_el.text_content()
+                if err_text:
+                    logger.warning("Login error: %s", err_text)
+                    return False
+        except Exception:
             pass
 
-        # If we're no longer on the login page, assume success
-        if not (
-            hostname == "accounts.google.com"
-            and path.startswith("/signin")
-        ):
-            logger.info("Login appeared successful for %s (URL: %s)",
-                        email, current_url)
+        # If we left the signin page, assume success
+        if not (hostname == "accounts.google.com" and path.startswith("/signin")):
+            logger.info("Login appeared successful (URL: %s)", current_url)
             return True
 
         logger.warning("Unexpected URL after login: %s", current_url)
         return False
 
-    except TimeoutException as exc:
-        logger.error("Timeout during login (URL: %s): %s", driver.current_url, exc)
+    except PwTimeout as exc:
+        logger.error("Timeout during login (URL: %s): %s", page.url, exc)
         return False
-    except WebDriverException as exc:
-        logger.error("WebDriver error during login: %s", exc)
+    except Exception as exc:
+        logger.error("Error during login: %s", exc)
         return False
 
 
-def _detect_2fa(driver: webdriver.Chrome) -> bool:
+def _detect_2fa(page: Page) -> bool:
     """Check if the current page is a Google 2-Step Verification challenge."""
-    current_url = driver.current_url
+    current_url = page.url
     if any(kw in current_url.lower() for kw in ("challenge", "verify", "two-step", "rejected")):
         return True
 
@@ -289,16 +207,15 @@ def _detect_2fa(driver: webdriver.Chrome) -> bool:
         "#idvAnyphoneverify",
         '[data-challengetype]',
     ]
-    for selector in two_fa_selectors:
+    for sel in two_fa_selectors:
         try:
-            el = driver.find_element(By.CSS_SELECTOR, selector)
-            if el.is_displayed():
+            if page.locator(sel).is_visible():
                 return True
-        except NoSuchElementException:
+        except Exception:
             continue
 
     try:
-        body_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+        body_text = page.locator("body").text_content().lower()
         two_fa_phrases = [
             "2-step verification",
             "verify it's you",
@@ -314,84 +231,36 @@ def _detect_2fa(driver: webdriver.Chrome) -> bool:
     return False
 
 
-def submit_2fa_code(driver: webdriver.Chrome, code: str) -> bool:
+def submit_2fa_code(page: Page, code: str) -> bool:
     """
     Submit a 2FA verification code on the current Google challenge page.
     Returns True if login appears successful, False otherwise.
     """
     try:
-        input_selectors = [
-            'input[type="tel"]',
-            "#idvPin",
-            'input[aria-label*="code" i]',
-            'input[aria-label*="verification" i]',
-            'input[aria-label*="Enter" i]',
-        ]
-        code_field = None
-        for selector in input_selectors:
+        input_sel = 'input[type="tel"], #idvPin'
+        page.wait_for_selector(input_sel, timeout=10000)
+        page.fill(input_sel, code)
+        page.wait_for_timeout(500)
+
+        # Click submit button
+        for btn_sel in ["#idvPreregisteredPhoneNext", 'button[type="submit"]']:
             try:
-                code_field = driver.find_element(By.CSS_SELECTOR, selector)
-                if code_field.is_displayed():
-                    break
-            except NoSuchElementException:
-                continue
-
-        if not code_field:
-            logger.error("Could not find 2FA code input field")
-            return False
-
-        code_field.clear()
-        code_field.send_keys(code)
-        time.sleep(0.5)
-
-        button_selectors = [
-            "#idvPreregisteredPhoneNext",
-            'button[type="submit"]',
-        ]
-        clicked = False
-        for selector in button_selectors:
-            try:
-                btn = driver.find_element(By.CSS_SELECTOR, selector)
-                if btn.is_displayed():
+                btn = page.locator(btn_sel)
+                if btn.is_visible():
                     btn.click()
-                    clicked = True
                     break
-            except NoSuchElementException:
+            except Exception:
                 continue
 
-        if not clicked:
-            buttons = driver.find_elements(By.TAG_NAME, "button")
-            for btn in buttons:
-                try:
-                    if btn.is_displayed():
-                        btn.click()
-                        clicked = True
-                        break
-                except Exception:
-                    continue
+        page.wait_for_timeout(3000)
 
-        time.sleep(3)
-
-        current_url = driver.current_url
+        current_url = page.url
         parsed = urlparse(current_url)
         hostname = parsed.hostname or ""
-        path = parsed.path or ""
 
-        if hostname == "myaccount.google.com" or (
-            hostname.endswith(".google.com") and "/u/" in path
-        ):
+        if hostname == "myaccount.google.com" or hostname.endswith(".google.com"):
             logger.info("2FA login succeeded")
             return True
-
-        try:
-            error_el = driver.find_element(
-                By.CSS_SELECTOR, '[jsname="B34EJ"], [aria-live="assertive"]'
-            )
-            if error_el.text:
-                logger.warning("2FA error: %s", error_el.text)
-                return False
-        except NoSuchElementException:
-            pass
 
         if "challenge" not in current_url.lower():
             logger.info("2FA login appeared successful (URL: %s)", current_url)
@@ -406,98 +275,63 @@ def submit_2fa_code(driver: webdriver.Chrome, code: str) -> bool:
 
 # ── Offer detection ───────────────────────────────────────────────────────────
 
-def _extract_payment_link(driver: webdriver.Chrome) -> Optional[str]:
-    """
-    Scan the current page for a Gemini Pro offer / activation link.
-
-    Strategy:
-    1. Look for anchor tags whose text or aria-label contains offer keywords.
-    2. Fall back to scanning all links for 'gemini' or 'upgrade' patterns.
-    3. Return the first matching href found.
-    """
+def _extract_payment_link(page: Page) -> Optional[str]:
+    """Scan the current page for a Gemini Pro offer / activation link."""
     keywords = config.GEMINI_OFFER_KEYWORDS
 
-    # -- Strategy 1: anchor text / aria-label match ---------------------------
-    all_links = driver.find_elements(By.TAG_NAME, "a")
-    for link in all_links:
+    all_links = page.locator("a")
+    count = all_links.count()
+    for i in range(min(count, 200)):
         try:
-            text = (link.text + " " + link.get_attribute("aria-label")).lower()
+            link = all_links.nth(i)
+            text = (link.text_content() or "").lower()
             href = link.get_attribute("href") or ""
             if any(kw in text for kw in keywords) and href:
-                logger.info("Found offer link via text match: %s", href)
+                logger.info("Found offer link via text: %s", href)
                 return href
         except Exception:
             continue
 
-    # -- Strategy 2: URL pattern scan -----------------------------------------
     url_patterns = re.compile(
         r"(gemini|upgrade|activate|offer|redeem|trial|checkout)",
         re.IGNORECASE,
     )
-    for link in all_links:
+    for i in range(min(count, 200)):
         try:
-            href = link.get_attribute("href") or ""
+            href = all_links.nth(i).get_attribute("href") or ""
             if url_patterns.search(href):
-                logger.info("Found offer link via URL pattern: %s", href)
+                logger.info("Found offer link via URL: %s", href)
                 return href
-        except Exception:
-            continue
-
-    # -- Strategy 3: button / CTA elements ------------------------------------
-    buttons = driver.find_elements(By.CSS_SELECTOR, "button, [role='button']")
-    for btn in buttons:
-        try:
-            text = btn.text.lower()
-            if any(kw in text for kw in keywords):
-                # Try to find parent anchor
-                try:
-                    parent_link = btn.find_element(By.XPATH, "ancestor::a")
-                    href = parent_link.get_attribute("href") or ""
-                    if href:
-                        logger.info("Found offer link via button parent: %s", href)
-                        return href
-                except NoSuchElementException:
-                    pass
-                # Return current URL as fallback (user will land on offer page)
-                logger.info("Found offer CTA button on page: %s", driver.current_url)
-                return driver.current_url
         except Exception:
             continue
 
     return None
 
 
-def _navigate_google_one(driver: webdriver.Chrome) -> Optional[str]:
-    """
-    Navigate to Google One and attempt to find the Gemini Pro offer link.
-
-    Returns the payment/activation URL or None if not found.
-    """
+def _navigate_google_one(page: Page) -> Optional[str]:
+    """Navigate to Google One and find the Gemini Pro offer link."""
     for url in (config.GOOGLE_ONE_URL, config.GOOGLE_ONE_OFFERS_URL):
         try:
             logger.info("Navigating to %s", url)
-            driver.get(url)
-            time.sleep(3)
+            page.goto(url, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
 
-            # Dismiss cookie/consent banners if present
-            for selector in (
-                '[aria-label="Accept all"]',
-                'button[jsname="higCR"]',
-                '[data-action="accept"]',
-            ):
+            # Dismiss cookie banners
+            for sel in ('[aria-label="Accept all"]', 'button[jsname="higCR"]'):
                 try:
-                    btn = driver.find_element(By.CSS_SELECTOR, selector)
-                    btn.click()
-                    time.sleep(1)
-                    break
-                except NoSuchElementException:
+                    btn = page.locator(sel)
+                    if btn.is_visible():
+                        btn.click()
+                        page.wait_for_timeout(1000)
+                        break
+                except Exception:
                     pass
 
-            link = _extract_payment_link(driver)
+            link = _extract_payment_link(page)
             if link:
                 return link
 
-        except (TimeoutException, WebDriverException) as exc:
+        except Exception as exc:
             logger.warning("Error accessing %s: %s", url, exc)
 
     return None
@@ -512,28 +346,28 @@ class GoogleAutomationError(Exception):
 def initiate_login(email: str, password: str,
                    device: DeviceProfile) -> tuple:
     """
-    Start the Google login process and return (driver, status).
+    Start the Google login process and return (browser, context, page, status).
 
     Status values:
-      - True: login succeeded, driver is on the account page
-      - False: login failed, driver should be quit
-      - "2fa": 2FA challenge detected, driver is kept alive for code submission
+      - True: login succeeded
+      - False: login failed
+      - "2fa": 2FA challenge detected
 
-    The caller is responsible for calling driver.quit() when done.
+    The caller is responsible for calling browser.close() when done.
     """
-    driver = _build_driver(device)
+    browser, context, page = _build_browser(device)
     try:
-        result = _gmail_login(driver, email, password)
-        return driver, result
+        result = _gmail_login(page, email, password)
+        return browser, context, page, result
     except Exception:
         try:
-            driver.quit()
+            browser.close()
         except Exception:
             pass
         raise
 
 
-def complete_login_and_check_offer(driver: webdriver.Chrome,
+def complete_login_and_check_offer(page: Page,
                                    two_fa_code: str = None) -> Optional[str]:
     """
     Complete the login and navigate to Google One to find the Gemini Pro offer.
@@ -542,28 +376,24 @@ def complete_login_and_check_offer(driver: webdriver.Chrome,
     Returns the offer link (str) or None.
     """
     if two_fa_code is not None:
-        if not submit_2fa_code(driver, two_fa_code):
+        if not submit_2fa_code(page, two_fa_code):
             return None
-    return _navigate_google_one(driver)
+    return _navigate_google_one(page)
 
 
 def check_gemini_offer(email: str, password: str,
                        device: DeviceProfile) -> Optional[str]:
     """
-    Main entry point.
+    Main entry point (non-interactive).
 
-    Logs into *email* / *password* using the supplied *device* profile,
-    navigates to Google One, and returns the Gemini Pro offer link (or None).
-
-    Raises :class:`GoogleAutomationError` if the driver cannot be started or
-    the login step fails with an error.
+    Raises :class:`GoogleAutomationError` on failure.
     """
-    driver: Optional[webdriver.Chrome] = None
+    browser = None
     try:
-        logger.info("Starting WebDriver for session %s", device.session_id)
-        driver = _build_driver(device)
+        logger.info("Starting browser for session %s", device.session_id)
+        browser, context, page = _build_browser(device)
 
-        logged_in = _gmail_login(driver, email, password)
+        logged_in = _gmail_login(page, email, password)
         if logged_in == "2fa":
             raise GoogleAutomationError(
                 "Two-step verification required. "
@@ -574,12 +404,12 @@ def check_gemini_offer(email: str, password: str,
                 "Login failed – please check your credentials."
             )
 
-        offer_link = _navigate_google_one(driver)
+        offer_link = _navigate_google_one(page)
         return offer_link
 
     finally:
-        if driver:
+        if browser:
             try:
-                driver.quit()
+                browser.close()
             except Exception:
                 pass

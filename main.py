@@ -161,7 +161,7 @@ async def check_offer_start(update: Update,
     )
 
     try:
-        driver, status = initiate_login(
+        browser, context, page, status = initiate_login(
             session["email"],
             session["password"],
             device,
@@ -177,7 +177,8 @@ async def check_offer_start(update: Update,
         return ConversationHandler.END
 
     if status == "2fa":
-        session["pending_driver"] = driver
+        session["pending_browser"] = browser
+        session["pending_page"] = page
         await update.message.reply_text(
             "🔐 *检测到两步验证*\n\n"
             "请输入你的 Google 身份验证器中的 6 位验证码：",
@@ -186,7 +187,7 @@ async def check_offer_start(update: Update,
         return AWAIT_2FA_CODE
 
     if not status:
-        driver.quit()
+        browser.close()
         await update.message.reply_text(
             "❌ *Error:* Login failed – please check your credentials.",
             parse_mode="Markdown",
@@ -195,11 +196,11 @@ async def check_offer_start(update: Update,
 
     # Login succeeded directly – navigate to Google One
     try:
-        offer_link = complete_login_and_check_offer(driver)
+        offer_link = complete_login_and_check_offer(page)
     except Exception:
         offer_link = None
     finally:
-        driver.quit()
+        browser.close()
 
     if offer_link:
         session["offer_link"] = offer_link
@@ -243,7 +244,9 @@ async def two_fa_code_input(update: Update,
         return AWAIT_2FA_CODE
 
     driver = session.pop("pending_driver", None)
-    if not driver:
+    browser = session.pop("pending_browser", None)
+    page = session.pop("pending_page", None)
+    if not browser or not page:
         await context.bot.send_message(
             chat_id=chat_id,
             text="⚠️ 会话已过期，请重新 /check\_offer",
@@ -257,16 +260,16 @@ async def two_fa_code_input(update: Update,
 
     login_ok = True
     try:
-        offer_link = complete_login_and_check_offer(driver, two_fa_code=code)
+        offer_link = complete_login_and_check_offer(page, two_fa_code=code)
         if offer_link is None:
-            login_ok = _still_logged_in(driver)
+            login_ok = _still_logged_in(page)
     except Exception as exc:
         logger.exception("Error during 2FA completion for chat %s", chat_id)
         offer_link = None
         login_ok = False
     finally:
         try:
-            driver.quit()
+            browser.close()
         except Exception:
             pass
 
@@ -301,10 +304,10 @@ async def two_fa_code_input(update: Update,
     return ConversationHandler.END
 
 
-def _still_logged_in(driver) -> bool:
-    """Quick check if the driver is still on a logged-in Google page."""
+def _still_logged_in(page) -> bool:
+    """Quick check if the page is still on a logged-in Google page."""
     try:
-        current_url = driver.current_url
+        current_url = page.url
         return "myaccount.google.com" in current_url or "/u/" in current_url
     except Exception:
         return False
@@ -312,13 +315,14 @@ def _still_logged_in(driver) -> bool:
 
 async def two_fa_cancel(update: Update,
                          context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel the 2FA flow and clean up the driver."""
+    """Cancel the 2FA flow and clean up the browser."""
     chat_id = update.effective_chat.id
     session = _get_session(chat_id)
-    driver = session.pop("pending_driver", None)
-    if driver:
+    browser = session.pop("pending_browser", None)
+    session.pop("pending_page", None)
+    if browser:
         try:
-            driver.quit()
+            browser.close()
         except Exception:
             pass
 
