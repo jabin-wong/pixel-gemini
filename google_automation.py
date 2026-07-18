@@ -24,6 +24,8 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+from selenium_stealth import stealth
+
 import config
 from device_simulator import DeviceProfile
 
@@ -33,7 +35,7 @@ logger = logging.getLogger(__name__)
 # ── Driver factory ────────────────────────────────────────────────────────────
 
 def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
-    """Return a headless Chrome WebDriver configured for the device profile."""
+    """Return a stealth Chrome WebDriver configured for the device profile."""
     options = Options()
 
     if config.HEADLESS:
@@ -45,36 +47,30 @@ def _build_driver(profile: DeviceProfile) -> webdriver.Chrome:
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-infobars")
     options.add_argument("--disable-notifications")
-    options.add_argument("--window-size=390,844")  # Pixel 10 Pro screen size
+    options.add_argument("--window-size=390,844")
     options.add_argument(f"--user-agent={profile.user_agent}")
 
-    # Mobile emulation – Pixel 10 Pro viewport
+    # Mobile emulation
     mobile_emulation = {
         "deviceMetrics": {"width": 390, "height": 844, "pixelRatio": 3.0},
         "userAgent": profile.user_agent,
     }
     options.add_experimental_option("mobileEmulation", mobile_emulation)
-
-    # Suppress automation flags
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--disable-features=IsolateOrigins,site-per-process")
 
-    service = Service()  # relies on chromedriver being on PATH (Replit provides it)
+    service = Service()
     driver = webdriver.Chrome(service=service, options=options)
 
-    # ── Anti-detection: hide webdriver via CDP ───────────────────────────────
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {
-            "source": """
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                window.chrome = {runtime: {}};
-            """
-        },
+    # Apply stealth patches to evade bot detection
+    stealth(
+        driver,
+        languages=["en-US", "en"],
+        vendor="Google Inc.",
+        platform="Linux armv8l",
+        webgl_vendor="Qualcomm",
+        renderer="Adreno (TM) 750",
+        fix_hairline=True,
     )
 
     driver.implicitly_wait(config.IMPLICIT_WAIT)
